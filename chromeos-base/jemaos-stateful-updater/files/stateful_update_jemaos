@@ -1,0 +1,260 @@
+#!/bin/sh
+
+# Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+
+# This scripts performs update of stateful partition directories useful for
+# dev_mode.
+
+# in order to support developers going from older images with the old shflags
+# we'll check for both new shflags and old shflags
+if [ -f /usr/share/misc/shflags ] ; then
+  . /usr/share/misc/shflags
+elif [ -f /usr/lib/shflags ] ; then
+  . /usr/lib/shflags
+else
+  echo >&2 "$0 Unable to source shflags"
+  exit 1
+fi
+
+# Constants for states.
+CLEAN_STATE="clean"
+OLD_STATE="old"
+RESET_STATE="reset"
+
+LSB_RELEASE="/etc/lsb-release"
+STATEFUL_DIR="/mnt/stateful_partition"
+UPDATE_STATE_FILE=".update_available"
+UPDATE_PROGRESS_FILE="/run/stateful_update/progress"
+
+LSB_RELEASE_FILE="/etc/lsb-release"
+BOARD_NAME_KEY="CHROMEOS_RELEASE_BOARD"
+CHROMIUMOS_VERSION_KEY="CHROMEOS_RELEASE_VERSION"
+JEMAOS_VERSION_KEY="CHROMEOS_RELEASE_BUILD_TYPE"
+
+LICENSE_UTIL_FILE="/usr/share/jemaos_shell/license-utils.sh"
+
+DEFINE_string stateful_change "${OLD_STATE}" \
+  "The state of the new stateful partition - used in update testing."
+
+FLAGS "$@" || exit 1
+
+# Die on error.
+set -e
+
+remove_quotes() {
+  echo "$1" | sed -e "s/^'//; s/'$//"
+}
+
+REPORT_JSON_FORMAT='{
+  "event_id": "%s",
+  "message": "%s",
+  "level": "%s",
+  "tags": [
+    ["level", "%s"],
+    ["board", "%s"]
+  ],
+  "release": "%s",
+  "extra": {
+    "license_id": "%s",
+    "crostini_version": "%s",
+    "chromiumos_version": "%s"
+  }
+}'
+
+get_report_event_id() {
+  local ts
+  local uuid
+  ts=$(date +%s)
+  uuid=$(uuidgen)
+  echo "${uuid}-${ts}" | md5sum | awk '{print $1}'
+}
+
+get_lsb_release_value() {
+  local key="$1"
+  grep "$key" "$LSB_RELEASE_FILE" 2> /dev/null | awk -F '=' '{print $2}'
+}
+
+get_board_name() {
+  get_lsb_release_value "${BOARD_NAME_KEY}"
+}
+
+get_chromiumos_version() {
+  get_lsb_release_value "${CHROMIUMOS_VERSION_KEY}"
+}
+
+get_jemaos_version() {
+  get_lsb_release_value "${JEMAOS_VERSION_KEY}"
+}
+
+get_license_id() {
+  "$LICENSE_UTIL_FILE" id 2> /dev/null
+}
+
+report() {
+  local level="$1"
+  local message="$2"
+  local board=""
+  local version=""
+  local chromiumos_version=""
+  local crostini_version=""
+  local license_id=""
+  local event_id=""
+
+  board=$(get_board_name)
+  version=$(get_jemaos_version)
+  chromiumos_version=$(get_chromiumos_version)
+  crostini_version=${JEMAOS_STATEFUL_UPDATE_VERSION}
+  license_id=$(get_license_id)
+  event_id=$(get_report_event_id)
+  local data=""
+  data=$(printf "$REPORT_JSON_FORMAT" "$event_id" "$message" "$level" "$level" \
+        "$board" "$version" "$license_id" \
+        "$crostini_version" "$chromiumos_version")
+  curl -d "${data}" \
+    -H 'Content-Type: application/json' \
+    -H "X-Sentry-Auth: Sentry sentry_version=7, sentry_key=9cad8ea2106c4e25994df775fb6db20c, sentry_client=cros-bash/0.1" \
+    https://sentry.io/api/4504632377868288/store/
+}
+
+download_stateful_payload(){
+  mkdir -p "$(dirname "$UPDATE_PROGRESS_FILE")"
+  # Download and unzip directories onto the stateful partition.
+  if [ -n "${JEMAOS_STATEFUL_UPDATE_VERSION}" ]; then
+    local tmp_file="/tmp/stateful_update-${JEMAOS_STATEFUL_UPDATE_VERSION}.tgz"
+    eval "curl -L --progress-bar --max-time 600 -C - \
+        \"${stateful_update_url}\" -o \"${tmp_file}\" \
+        2>\"${UPDATE_PROGRESS_FILE}\""
+    tar --ignore-command-error --overwrite --directory=${STATEFUL_DIR} -xzf "${tmp_file}"
+    rm "${tmp_file}"
+  else
+    eval "curl -L --progress-bar --max-time 600 \"${stateful_update_url}\" 2>\"${UPDATE_PROGRESS_FILE}\"" |
+        tar --ignore-command-error --overwrite --directory=${STATEFUL_DIR} -xz
+  fi
+}
+
+report_download_failure() {
+  local code="$1"
+  report "error" "Download failed with code ${code}"
+}
+
+report_download_success() {
+  report "info" "Download successfully"
+}
+
+report_invalid_payload() {
+  report "error" "Invalid payload"
+}
+
+update_dev_image () {
+  local base_update_url devserver_url
+  local local_payload_path
+  local path=$(remove_quotes "${FLAGS_ARGV}")
+
+  if [ -z "${path}" ]; then
+    if [ -f "${STATEFUL_DIR}${LSB_RELEASE}" ]; then
+      devserver_url=$(grep CHROMEOS_DEVSERVER ${STATEFUL_DIR}${LSB_RELEASE} |
+          cut -f 2 -d '=')
+    fi
+    if [ -z "${devserver_url}" ]; then
+      devserver_url=$(grep CHROMEOS_DEVSERVER ${LSB_RELEASE} | cut -f 2 -d '=')
+    fi
+    # Sanity check.
+    if [ -z "${devserver_url}" ]; then
+      echo >&2 "No CHROMEOS_DEVSERVER URL found in lsb-release file."
+      exit 1
+    fi
+    # Devserver URL should never contain "/update"
+    devserver_url=$(echo ${devserver_url} | sed -e 's#/update##')
+    base_update_url="${devserver_url}/static"
+  # Determine whether the path is local.
+  elif [ -f "${path}" ] || [ "${path}" = "-" ]; then
+    local_payload_path=${path}
+  else
+    base_update_url=${path}
+  fi
+
+  if [ -n "${base_update_url}" ] || [ -n "${JEMAOS_STATEFUL_UPDATE_URL}" ]; then
+    local stateful_update_url="${base_update_url}/stateful.tgz"
+    if [ -n "$JEMAOS_STATEFUL_UPDATE_URL" ]; then
+        stateful_update_url="$JEMAOS_STATEFUL_UPDATE_URL"
+    fi
+    local download_exit_code=0
+    for i in `seq 1 2`; do
+      if [ $i -eq 1 ]; then
+        echo >&2 "Downloading stateful payload from ${stateful_update_url}"
+      else
+        echo >&2 "Downloading failed, retrying."
+      fi
+      if download_stateful_payload; then
+        download_exit_code=$?
+        echo >&2 "Downloading command returns code ${download_exit_code}."
+        break
+      else
+        download_exit_code=$?
+        echo >&2 "Downloading command returns code ${download_exit_code}."
+      fi
+    done
+    if [ ${download_exit_code} -ne 0 ]; then
+      report_download_failure "${download_exit_code}"
+      return ${download_exit_code}
+    fi
+    report_download_success
+    echo >&2 "Successfully downloaded update."
+  else
+    echo >&2 "Reading local payload ${local_payload_path}"
+    # Set timeout to four minutes to avoid waiting on stdin indefinitely.
+    timeout 240s tar --ignore-command-error --overwrite \
+        --directory=${STATEFUL_DIR} -xzf ${local_payload_path}
+    exit_code=$?
+    if [ "${exit_code}" -ne 0 ]; then
+      echo >&2 "Failed to unzip and write the stateful update."
+      return "${exit_code}"
+    fi
+    echo >&2 "Successfully retrieved update."
+  fi
+
+  if [ ! -d "${STATEFUL_DIR}/var_new" ] ||
+      [ ! -d "${STATEFUL_DIR}/dev_image_new" ]; then
+    echo >&2 "Missing var or dev_image in stateful payload."
+    report_invalid_payload
+    return 1
+  fi
+}
+
+reset_state () {
+  echo >&2 "Resetting stateful update state."
+  rm -f "${STATEFUL_DIR}/${UPDATE_STATE_FILE}"
+  rm -rf "${STATEFUL_DIR}/var_new"
+  rm -rf "${STATEFUL_DIR}/dev_image_new"
+}
+
+update_old_state () {
+  echo >&2 "Performing standard stateful update."
+  echo -n "" > "${STATEFUL_DIR}/${UPDATE_STATE_FILE}"
+}
+
+update_clean_state () {
+  echo >&2 "Restoring state to factory_install with dev_image."
+  echo -n "clobber" > "${STATEFUL_DIR}/${UPDATE_STATE_FILE}"
+}
+
+main () {
+  if [ "${FLAGS_stateful_change}" = "${RESET_STATE}" ]; then
+    reset_state
+  elif update_dev_image; then
+    if [ "${FLAGS_stateful_change}" = "${OLD_STATE}" ]; then
+      update_old_state
+    elif [ "${FLAGS_stateful_change}" = "${CLEAN_STATE}" ]; then
+      update_clean_state
+    else
+      echo >&2 "Invalid state given to stateful update.  Aborting..."
+      return 1
+    fi
+  else
+    return 1
+  fi
+}
+
+main $@
