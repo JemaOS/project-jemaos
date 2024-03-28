@@ -1,1 +1,0 @@
-/home/john/r114/jemaos/overlays/project-jemaos/chromeos-base/jemaos-shell-daemon-go/jemaos-shell-daemon-go-0.0.1.ebuild
